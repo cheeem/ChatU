@@ -20,7 +20,11 @@
 
             join_btn.addEventListener("click", function(e) {
                 this.disabled = true;
+                join(this);
+            });
 
+            function join() {
+            
                 const websocket = new WebSocket(`ws://localhost:3000/websocket?id=${username.value}`);
 
                 // websocket.onopen = function() {
@@ -28,11 +32,9 @@
                 //     websocket.send(username.value);
                 // }
 
-                const btn = this;
-
                 websocket.onclose = function() {
                     console.log("connection closed");
-                    btn.disabled = false;
+                    join();
                 }
 
                 websocket.onmessage = function(e) {
@@ -41,12 +43,13 @@
                 }
 
                 input.onkeydown = function(e) {
-                    if (e.key == "Enter") {
+                    if (e.key === "Enter") {
                         websocket.send(input.value);
                         input.value = "";
                     }
                 }
-            });
+
+            }
         </script>
     </body>
 </html>
