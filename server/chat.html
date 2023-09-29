@@ -34,7 +34,7 @@
 
                 websocket.onclose = function() {
                     console.log("connection closed");
-                    join();
+                    join_btn.disabled = false;
                 }
 
                 websocket.onmessage = function(e) {
