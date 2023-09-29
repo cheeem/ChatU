@@ -10,8 +10,8 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt };
 use serde::Deserialize;
 use std::collections::{ HashMap, HashSet };
-use std::str::Split;
 use std::sync::{ Arc, Mutex, MutexGuard };
+use std::sync::atomic::{ Ordering, AtomicBool };
 use std::net::TcpListener;
 
 #[derive(Debug)]
@@ -75,23 +75,27 @@ fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], user_id: &str) 
 
     println!("{:#?}", rooms);
 
-    'room_loop: for (room_idx, Room { tx, users }) in rooms.iter_mut().enumerate() {
+    for optimal_user_count in 0..MAX_ROOM_SIZE { //test this
 
-        println!("{room_idx}: {}, {}", tx.receiver_count(), users.len());
+        'room_loop: for (room_idx, Room { tx, users }) in rooms.iter_mut().enumerate() {
 
-        if tx.receiver_count() >= MAX_ROOM_SIZE {
-            continue;
-        }
-
-        for skipped_user_id in skipped_users {
-            if users.contains(skipped_user_id) {
-                continue 'room_loop;
+            println!("{room_idx}: {}, {}", tx.receiver_count(), users.len());
+    
+            if tx.receiver_count() >= optimal_user_count {
+                continue;
             }
-        } 
-
-        users.push(user_id.to_owned());
-
-        return (tx.clone(), tx.subscribe(), room_idx);
+    
+            for skipped_user_id in skipped_users {
+                if users.contains(skipped_user_id) {
+                    continue 'room_loop;
+                }
+            } 
+    
+            users.push(user_id.to_owned());
+    
+            return (tx.clone(), tx.subscribe(), room_idx);
+    
+        }
 
     }
 
@@ -114,9 +118,9 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, user_id: String) {
 
     let mut skipped_users: Vec<String> = Vec::new();
 
-    loop {
+    let skipped: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
-        //let state: Arc<AppState> = state.clone();
+    loop {
 
         let (tx, mut rx, room_idx) = find_room(&state.rooms, &skipped_users, &user_id);
     
@@ -124,28 +128,18 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, user_id: String) {
         tracing::debug!("{msg}");
         let _ = tx.send(msg);
 
-        let id: String = user_id.clone();
+        let skipped_state: Arc<AtomicBool> = skipped.clone();
     
         let mut send_task: JoinHandle<SplitSink<WebSocket, Message>> = tokio::spawn(async move {
             
             while let Ok(msg) = rx.recv().await {
 
-                let mut iter: Split<'_, &str> = msg.split(":");
+                if skipped_state.load(Ordering::Relaxed) {
+                    break;
+                }
 
-                if let Some(cmd) = iter.next() {
-
-                    if cmd == "__skip" {
-
-                        if let Some(_id) = iter.next() {
-                            if id == _id {
-                                break;
-                            }
-                        }
-
-                        continue;
-
-                    }
-
+                if msg == "__skipped" {
+                    continue;
                 }
 
                 if sender.send(Message::Text(msg)).await.is_err() {
@@ -160,25 +154,23 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, user_id: String) {
     
         let tx_chat: broadcast::Sender<String> = tx.clone();
         
-        let id: String = user_id.clone();
+        let skipped_state: Arc<AtomicBool> = skipped.clone();
     
-        let mut recv_task: JoinHandle<(SplitStream<WebSocket>, bool)> = tokio::spawn(async move {
-            
-            let mut skipped: bool = false;
-            
-            while let Some(Ok(Message::Text(text))) = receiver.next().await {
+        let mut recv_task: JoinHandle<SplitStream<WebSocket>> = tokio::spawn(async move {
+                        
+            while let Some(Ok(Message::Text(msg))) = receiver.next().await {
        
-                if text == "__skip" {
-                    skipped = true;
-                    let _ = tx_chat.send(format!("__skip:{}", &id));
+                if msg == "__skip" {
+                    skipped_state.store(true, Ordering::Relaxed);
+                    let _ = tx_chat.send(msg);
                     break;
                 }
 
-                let _ = tx_chat.send(text);
+                let _ = tx_chat.send(msg);
             
             }
     
-            (receiver, skipped)
+            receiver
     
         });
     
@@ -204,7 +196,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, user_id: String) {
                     return send_task.abort();
 
                 },
-                Ok((_receiver, skipped)) => match skipped {
+                Ok(_receiver) => match skipped.load(Ordering::Relaxed) {
                     false => {
 
                         let rooms: &mut [Room] = &mut *state.rooms.lock().unwrap();
