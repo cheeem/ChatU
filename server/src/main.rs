@@ -15,8 +15,39 @@ use std::sync::atomic::{ Ordering, AtomicBool };
 use std::net::TcpListener;
 
 #[derive(Debug)]
-struct AppState {
+struct ChatApp {
     rooms: Mutex<Vec<Room>>,
+}
+
+impl ChatApp {
+
+    fn new() -> Self { ChatApp { rooms: Mutex::new(Vec::new()) } }
+
+    fn leave(&self, room_idx: usize, user_id: &str) -> &Self {
+
+        let rooms: &mut [Room] = &mut *self.rooms.lock().unwrap();
+        let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+
+        room.users.remove(room.users.iter().position(|x| *x == user_id).unwrap());
+        
+        tracing::debug!("{user_id} left");
+        let _ = room.tx.send("they gone 🥀".to_owned());
+
+        self
+
+    }
+
+    fn skip(&self, room_idx: usize, skipped_users: &mut Vec<String>) {
+
+        let rooms: &[Room] = &*self.rooms.lock().unwrap();
+        let room: &Room = rooms.get(room_idx).unwrap();
+
+        for user_id in &room.users {
+            skipped_users.push(user_id.to_owned());
+        }
+
+    }
+
 }
 
 #[derive(Debug)]
@@ -40,14 +71,12 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let rooms: Mutex<Vec<Room>> = Mutex::new(Vec::new());
+    let app: Arc<ChatApp> = Arc::new(ChatApp::new());
 
-    let app_state: Arc<AppState> = Arc::new(AppState { rooms });
-
-    let app: Router = Router::new()
+    let router: Router = Router::new()
         .route("/", get(index))
         .route("/websocket", get(websocket_handler))
-        .with_state(app_state);
+        .with_state(app);
 
     let listener: TcpListener = TcpListener::bind("127.0.0.1:3000").unwrap();
 
@@ -55,7 +84,7 @@ async fn main() {
 
     axum::Server::from_tcp(listener)
         .unwrap()
-        .serve(app.into_make_service())
+        .serve(router.into_make_service())
         .await
         .unwrap();
 
@@ -64,7 +93,7 @@ async fn main() {
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     Query(JoiningUser { id, }): Query<JoiningUser>, 
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ChatApp>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| websocket(socket, state, id))
 }
@@ -112,7 +141,7 @@ fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], user_id: &str) 
 
 }
 
-async fn websocket(stream: WebSocket, state: Arc<AppState>, user_id: String) {
+async fn websocket(stream: WebSocket, app: Arc<ChatApp>, user_id: String) {
 
     let (mut sender, mut receiver) = stream.split();
 
@@ -122,7 +151,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, user_id: String) {
 
     'join_loop: loop {
 
-        let (tx, mut rx, room_idx) = find_room(&state.rooms, &skipped_users, &user_id);
+        let (tx, mut rx, room_idx) = find_room(&app.rooms, &skipped_users, &user_id);
 
         skipped.store(false, Ordering::Relaxed);
     
@@ -177,75 +206,31 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, user_id: String) {
     
         tokio::select! {
             _ = (&mut send_task) => {
-
-                let rooms: &mut [Room] = &mut *state.rooms.lock().unwrap();
-                let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-
-                room.users.remove(room.users.iter().position(|x| *x == user_id).unwrap());
-                
                 recv_task.abort();
-
-                let msg: String = format!("{user_id} left.");
-                tracing::debug!("{msg}");
-                let _ = tx.send(msg);
-
-                break 'join_loop;
-                
+                app.leave(room_idx, &user_id);
+                break 'join_loop;  
             }
             result = (&mut recv_task) => match result {
                 Err(_) => {
-
-                    let rooms: &mut [Room] = &mut *state.rooms.lock().unwrap();
-                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-
-                    room.users.remove(room.users.iter().position(|x| *x == user_id).unwrap());
-
                     send_task.abort();
-
-                    let msg: String = format!("{user_id} left.");
-                    tracing::debug!("{msg}");
-                    let _ = tx.send(msg);
-
+                    app.leave(room_idx, &user_id);
                     break 'join_loop;
-
                 },
                 Ok(_receiver) => match skipped.load(Ordering::Relaxed) {
                     false => {
-
-                        let rooms: &mut [Room] = &mut *state.rooms.lock().unwrap();
-                        let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-
-                        room.users.remove(room.users.iter().position(|x| *x == user_id).unwrap());
-
                         send_task.abort();
-
-                        let msg: String = format!("{user_id} left.");
-                        tracing::debug!("{msg}");
-                        let _ = tx.send(msg);
-
+                        app.leave(room_idx, &user_id);
                         break 'join_loop;
-
                     },
                     true => match send_task.await {
-                        Err(_) => break 'join_loop,
+                        Err(_) => {
+                            app.leave(room_idx, &user_id);
+                            break 'join_loop;
+                        }
                         Ok(_sender) => {
-
+                            app.leave(room_idx, &user_id).skip(room_idx, &mut skipped_users);
                             receiver = _receiver;
                             sender = _sender;
-
-                            let rooms: &mut [Room] = &mut *state.rooms.lock().unwrap();
-                            let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-
-                            room.users.remove(room.users.iter().position(|x| *x == user_id).unwrap());
-
-                            for user_id in &room.users {
-                                skipped_users.push(user_id.to_owned());
-                            }
-
-                            let msg: String = format!("{user_id} left.");
-                            tracing::debug!("{msg}");
-                            let _ = tx.send(msg);
-                            
                         }
                     }
                 }
