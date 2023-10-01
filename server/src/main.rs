@@ -19,33 +19,38 @@ struct ChatApp {
     rooms: Mutex<Vec<Room>>,
 }
 
-impl ChatApp {
+enum ChatEvent {
+    Join,
+    Leave,
+    Skip,
+    Message, 
+    Connect,
+}
 
-    fn new() -> Self { ChatApp { rooms: Mutex::new(Vec::new()) } }
+impl Room {
 
-    fn leave(&self, room_idx: usize, user_id: &str) -> &Self {
+    fn new(tx: broadcast::Sender<String>, user_id: String) -> Self {
+        Room { tx: tx.clone(), users: vec![user_id.to_owned()] }
+    }
 
-        let rooms: &mut [Room] = &mut *self.rooms.lock().unwrap();
-        let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-
-        room.users.remove(room.users.iter().position(|x| *x == user_id).unwrap());
+    fn remove_user(&mut self, user_id: &str) -> &Self {
         
-        tracing::debug!("{user_id} left");
-        let _ = room.tx.send("they gone 🥀".to_owned());
+        if let Some(idx) = self.users.iter().position(|x| *x == user_id) {
+            self.users.remove(idx);
+        }
 
         self
 
     }
 
-    fn skip(&self, room_idx: usize, skipped_users: &mut Vec<String>) {
-
-        let rooms: &[Room] = &*self.rooms.lock().unwrap();
-        let room: &Room = rooms.get(room_idx).unwrap();
-
-        for user_id in &room.users {
+    fn skip_users(&self, skipped_users: &mut Vec<String>) -> &Self  {
+        
+        for user_id in &self.users {
             skipped_users.push(user_id.to_owned());
         }
 
+        self
+        
     }
 
 }
@@ -71,7 +76,7 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let app: Arc<ChatApp> = Arc::new(ChatApp::new());
+    let app: Arc<ChatApp> = Arc::new(ChatApp { rooms: Mutex::new(Vec::new()) });
 
     let router: Router = Router::new()
         .route("/", get(index))
@@ -132,10 +137,7 @@ fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], user_id: &str) 
 
     let room_idx: usize = rooms.len();
 
-    rooms.push(Room { 
-        tx: tx.clone(), 
-        users: vec![user_id.into()],
-    });
+    rooms.push(Room::new(tx.clone(), user_id.to_owned()));
 
     return (tx, rx, room_idx);
 
@@ -206,31 +208,58 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, user_id: String) {
     
         tokio::select! {
             _ = (&mut send_task) => {
+
                 recv_task.abort();
-                app.leave(room_idx, &user_id);
+
+                let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                room.remove_user(&user_id);
+
                 break 'join_loop;  
             }
             result = (&mut recv_task) => match result {
                 Err(_) => {
+
                     send_task.abort();
-                    app.leave(room_idx, &user_id);
+
+                    let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                    room.remove_user(&user_id);
+
                     break 'join_loop;
+
                 },
                 Ok(_receiver) => match skipped.load(Ordering::Relaxed) {
                     false => {
+
                         send_task.abort();
-                        app.leave(room_idx, &user_id);
+
+                        let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                        let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                        room.remove_user(&user_id);
+
                         break 'join_loop;
+
                     },
                     true => match send_task.await {
                         Err(_) => {
-                            app.leave(room_idx, &user_id);
+
+                            let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                            let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                            room.remove_user(&user_id);
+
                             break 'join_loop;
+
                         }
                         Ok(_sender) => {
-                            app.leave(room_idx, &user_id).skip(room_idx, &mut skipped_users);
+
+                            let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                            let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                            room.remove_user(&user_id).skip_users(&mut skipped_users);
+
                             receiver = _receiver;
                             sender = _sender;
+
                         }
                     }
                 }
