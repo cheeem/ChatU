@@ -1,13 +1,23 @@
-import './app.css';
-import { createRef, RefObject, } from 'preact';
-import { signal, effect, Signal } from "@preact/signals";
+import "./app.css";
+import { createRef, } from "preact";
+import { signal, effect, Signal, } from "@preact/signals";
+
+const CLIENT_EVENT_MAP = {
+	"SKIP": 0,
+	"LEAVE": 1,
+	"CONNECT": 2,
+} as const;
+
+type ClientEvent = keyof typeof CLIENT_EVENT_MAP;
 
 export function App() {
 
 	const websocket: Signal<WebSocket | null> = signal(null);
 	const joined: Signal<boolean> = signal(false);
 	const messages: Signal<string> = signal("");
+
 	const userid = createRef<HTMLInputElement>();
+	const text = createRef<HTMLInputElement>();
 
 	effect(() => {
 
@@ -15,7 +25,7 @@ export function App() {
 			return;
 		}
 
-		websocket.value.onclose = () => exit(joined);
+		websocket.value.onclose = () => leave(joined);
 		websocket.value.onmessage = (e: MessageEvent) => messageReceived(e, messages);
 
 	});
@@ -23,80 +33,94 @@ export function App() {
 	return (
 		<>
 
-			<input id="userid" type="text" placeholder="userid" 
+			<input type="text" placeholder="userid"
+				ref={userid} 
 				disabled={joined}
-				ref={userid}
 			/>
 
-			<button id="join" type="button" 
+			<button type="button" 
 				disabled={joined}
-				onClick={() => join(websocket, userid, joined)}
+				onClick={() => join(websocket, joined, userid.current!.value)}
 			> Join Chat </button>
 
 			<textarea id="messages" cols={30} rows={10}
 				value={messages}
 			></textarea>
 
-			<input type="text" placeholder="type something..." 
+			<input placeholder="type something..." 
+				ref={text}
 				disabled={!joined} 
-				onKeyDown={(e) => handleInput(e, websocket)} 
+				onKeyDown={(e) => e.key !== "Enter" && message(websocket, text.current!)} 
 			/>
 
-			<button id="skip" type="button"
-				onClick={() => skip(websocket)}
+			<button type="button"
+				disabled={!joined} 
+				onClick={() => message(websocket, text.current!)}
+			> Send </button>
+
+			<button type="button"
+				disabled={!joined} 
+				onClick={() => event(websocket, "SKIP")}
 			> Skip </button>
+
+			<button type="button"
+				disabled={!joined} 
+				onClick={() => event(websocket, "LEAVE")}
+			> Leave </button>
+
+			<button type="button"
+				disabled={!joined} 
+				onClick={() => event(websocket, "CONNECT")}
+			> Connect </button>
 
 		</>
 	);
 
 }
 
-function exit(disabled: Signal<boolean>) {
+function event(websocket: Signal<WebSocket | null>, event: ClientEvent) {
 	
-	console.log("exited");
-	disabled.value = false;
+	if(!websocket.value) {
+		return;
+	}
+
+	const uint8: Uint8Array = new Uint8Array(1);
+	uint8[0] = CLIENT_EVENT_MAP[event];
+	websocket.value.send(uint8.buffer);
+
+}
+
+function leave(joined: Signal<boolean>) {
+	
+	joined.value = false;
 	
 }
 
 function messageReceived(e: MessageEvent, messages: Signal<string>) {
 
-	console.log("received message: "+e.data);
 	messages.value += e.data+"\r\n";
 
 }
 
-function handleInput(e: KeyboardEvent, websocket: Signal<WebSocket | null>) {
-	
-	if (!websocket.value) {
-		return;
-	}
-
-	if (e.key === "Enter") {
-		const input: HTMLInputElement = e.target as HTMLInputElement;
-		websocket.value.send(input.value);
-		input.value = "";
-	}
-
-}
-
-function skip(websocket: Signal<WebSocket | null>) {
+function message(websocket: Signal<WebSocket | null>, input: HTMLInputElement) {
 	
 	if(!websocket.value) {
 		return;
-	} 
+	}
 
-	websocket.value.send("__skip");
+	websocket.value.send(input.value);
+	
+	input.value = "";
 
 }
 
-function join(websocket: Signal<WebSocket | null>, userid: RefObject<HTMLInputElement>, joined: Signal<boolean>) {
-	
-	if(userid.current === null) {
+function join(websocket: Signal<WebSocket | null>, joined: Signal<boolean>, userid: string) {
+
+	if(joined.value) {
 		return;
 	}
 
-	websocket.value = new WebSocket(`ws://localhost:3000/join?id=${userid.current.value}`);
-	console.log("joined");
+	websocket.value = new WebSocket(`ws://localhost:3000/join?id=${userid}`);
 	joined.value = true;
 
 }
