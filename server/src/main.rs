@@ -1,8 +1,8 @@
 use axum::extract::ws::{ Message, WebSocket, WebSocketUpgrade };
-use axum::extract::{ State, Query, Extension, };
-use axum::response::{ IntoResponse, Json, };
+use axum::extract::{ self, State, Query, Extension, };
+use axum::response::{ self, IntoResponse, };
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{ get, post, put };
 use axum::Router;
 use futures::sink::SinkExt;
 use futures::stream::{ SplitSink, SplitStream, StreamExt };
@@ -36,6 +36,7 @@ enum ServerEvent {
 #[derive(Debug)]
 struct ChatApp { 
     rooms: Mutex<Vec<Room>>,
+    db: Pool<MySql>
 }
 
 #[derive(Debug)]
@@ -54,8 +55,25 @@ struct UserContacts {
     x500: String, 
     first_name: Option<String>,
     last_name: Option<String>,
-    //year: Option<u8>,
-    //residence: Option<String>, 
+    phone_number: Option<String>,
+    instagram: Option<String>,
+    snapchat: Option<String>,
+    discord: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserContactUpdate {
+    x500: String, 
+    field: String,
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserConnection {
+    x500: String, 
+    partner_x500: String,
+    first_name: Option<String>,
+    last_name: Option<String>,
     phone_number: Option<String>,
     instagram: Option<String>,
     snapchat: Option<String>,
@@ -68,8 +86,6 @@ struct UserContacts {
 struct Contacts {
     first_name: Option<String>,
     last_name: Option<String>,
-    //year: Option<u8>,
-    //residence: Option<String>, 
     phone_number: Option<String>,
     instagram: Option<String>,
     snapchat: Option<String>,
@@ -120,22 +136,26 @@ impl Room {
 const MAX_ROOM_SIZE: usize = 2;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "chatu=trace".into()))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let app: Arc<ChatApp> = Arc::new(ChatApp { rooms: Mutex::new(Vec::new()) });
-
     let pool: Pool<MySql> = MySqlPoolOptions::new()
-        .connect("mysql://cheemie:ex_pw@localhost:3306/chatu").await?;
+        .connect("mysql://cheemie:ex_pw@localhost:3306/chatu").await.unwrap();
+
+    let app: Arc<ChatApp> = Arc::new(ChatApp { rooms: Mutex::new(Vec::new()), db: pool });
 
     let router: Router = Router::new()
         .route("/join", get(websocket_handler))
-        .with_state(app)
-        .layer(Extension(pool));
+        .route("/get_contacts", get(get_contacts))
+        .route("/new_contacts", post(new_contacts))
+        .route("/edit_contact", put(edit_contact))
+        .route("/get_connections", get(get_connections))
+        .route("/new_connection", get(new_connection))
+        .with_state(app);
 
     let listener: TcpListener = TcpListener::bind("127.0.0.1:3000").unwrap();
 
@@ -147,15 +167,164 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .unwrap();
 
+}
+
+async fn get_connections(Query(User { x500, }): Query<User>, State(app): State<Arc<ChatApp>>) -> Result<response::Json<Vec<Contacts>>, StatusCode> {
+
+    let sql: &str = "SELECT * FROM connections WHERE x500 = \"$1\"";
+    
+    let connections: Vec<Contacts> = sqlx::query_as(sql)
+        .bind(x500)
+        .fetch_all(&app.db)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    Ok(response::Json(connections))
+
+}
+
+// maybe use the app state room contacts to build connections instead of json
+async fn new_connection(State(app): State<Arc<ChatApp>>, extract::Json(connection): extract::Json<UserConnection>) -> Result<(), StatusCode> {
+
+    let sql: &str = "
+        INSERT INTO connections (
+            x500,
+            partner_x500,
+            first_name, 
+            last_name,
+            phone_number,
+            instagram,
+            snapchat, 
+            discord 
+        ) VALUES (
+            \"$1\",
+            \"$2\",
+            \"$3\",
+            \"$4\",
+            \"$5\",
+            \"$6\",
+            \"$7\",
+            \"$8\"
+        )
+    ";
+
+    sqlx::query(sql)
+        .bind(connection.x500)
+        .bind(connection.partner_x500)
+        .bind(connection.first_name)
+        .bind(connection.last_name)
+        .bind(connection.phone_number)
+        .bind(connection.instagram)
+        .bind(connection.snapchat)
+        .bind(connection.discord)
+        .execute(&app.db)
+        .await
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
     Ok(())
 
 }
 
-// async fn contacts(Query(User { x500, }): Query<User>) -> Json {
+async fn get_contacts(Query(User { x500, }): Query<User>, State(app): State<Arc<ChatApp>>) -> Result<response::Json<Contacts>, StatusCode> {
 
+    let sql: &str = "SELECT * FROM contacts WHERE x500 = \"$1\"";
 
+    let contacts: Contacts = sqlx::query_as(sql)
+        .bind(x500)
+        .fetch_optional(&app.db)
+        .await
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
-// }
+    Ok(response::Json(contacts))
+
+}
+
+async fn new_contacts(State(app): State<Arc<ChatApp>>, extract::Json(contacts): extract::Json<UserContacts>) -> &'static str {
+
+    let sql: &str = "
+        INSERT INTO contacts (
+            x500,
+            first_name, 
+            last_name,
+            phone_number,
+            instagram,
+            snapchat, 
+            discord 
+        ) VALUES (
+            \"$1\",
+            \"$2\",
+            \"$3\",
+            \"$4\",
+            \"$5\",
+            \"$6\",
+            \"$7\"
+        )
+    ";
+
+    let _ = sqlx::query(sql)
+        .bind(contacts.x500)
+        .bind(contacts.first_name)
+        .bind(contacts.last_name)
+        .bind(contacts.phone_number)
+        .bind(contacts.instagram)
+        .bind(contacts.snapchat)
+        .bind(contacts.discord)
+        .execute(&app.db)
+        .await
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY);
+
+    "hai"
+
+    //Ok(())
+
+}
+
+async fn edit_contact(Query(contact_update): Query<UserContactUpdate>, State(app): State<Arc<ChatApp>>) -> Result<(), StatusCode> {
+
+    match contact_update.field.as_str() {
+        "x500" | "first_name" | "last_name" | "phone_number" | "instagram" | "snapchat" | "discord" => Ok(()),
+        _ => Err(StatusCode::NOT_ACCEPTABLE),
+    }?;
+
+    let contact_deleted: bool = contact_update.value.is_none();
+
+    if contact_deleted {
+
+        let sql: &str = "
+            UPDATE contacts 
+            SET $1 = \"$2\" 
+            WHERE x500 = NULL 
+        ";
+
+        sqlx::query(sql)
+            .bind(contact_update.x500)
+            .bind(contact_update.field)
+            .execute(&app.db)
+            .await
+            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
+        return Ok(());
+
+    }
+
+    let sql: &str = "
+        UPDATE contacts 
+        SET $1 = \"$2\" 
+        WHERE x500 = \"$3\" 
+    ";
+
+    sqlx::query(sql)
+        .bind(contact_update.x500)
+        .bind(contact_update.field)
+        .bind(contact_update.value)
+        .execute(&app.db)
+        .await
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    Ok(())
+
+}
 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
@@ -174,11 +343,11 @@ async fn websocket_handler(
         discord: user_contacts.discord,
     };
 
-    ws.on_upgrade(|socket| websocket(socket, state, x500, contacts))
+    ws.on_upgrade(|socket| websocket(socket, state, x500, /*contacts*/))
 
 }
 
-async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, mut contacts: Contacts) {
+async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, /*contacts: Contacts*/) {
 
     let (mut sender, mut receiver) = stream.split();
 
@@ -208,7 +377,7 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, mut conta
     
         let tx_chat: broadcast::Sender<Option<String>> = tx.clone();
             
-        let mut recv_task: JoinHandle<(SplitStream<WebSocket>, bool, Contacts)> = tokio::spawn(async move {
+        let mut recv_task: JoinHandle<(SplitStream<WebSocket>, bool)> = tokio::spawn(async move {
 
             let mut skipped: bool = false;
             //let name = contacts.first_name.as_ref().map(|str| str.as_str()).unwrap_or("");
@@ -234,6 +403,8 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, mut conta
                                     break;
                                 },
                                 ClientEvent::Connect => {
+                                    //sqlx::query("SELECT * FROM contacts").fetch_all(&app.db);
+                                    
                                     //let name: &String = &(contacts.first_name.unwrap_or("".to_owned())).clone();
                                     //println!("{name}");
                                 },
@@ -249,7 +420,7 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, mut conta
             
             }
     
-            (receiver, skipped, contacts)
+            (receiver, skipped)
     
         });
     
@@ -276,7 +447,7 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, mut conta
                     break 'join_loop;
 
                 },
-                Ok((_receiver, skipped, _contacts)) => match skipped {
+                Ok((_receiver, skipped)) => match skipped {
                     false => {
 
                         send_task.abort();
@@ -306,7 +477,6 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, mut conta
 
                             receiver = _receiver;
                             sender = _sender;
-                            contacts = _contacts;
 
                         }
                     }
