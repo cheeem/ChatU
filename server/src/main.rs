@@ -1,18 +1,21 @@
 use axum::extract::ws::{ Message, WebSocket, WebSocketUpgrade };
-use axum::extract::{ self, State, Query, Extension, };
+use axum::extract::{ self, State, Query, Extension };
 use axum::response::{ self, IntoResponse, };
-use axum::http::StatusCode;
-use axum::routing::{ get, post, put };
+use axum::http::{ Method, StatusCode, };
+use axum::routing::{ get, post, patch };
 use axum::Router;
+use tower_http::cors::{ CorsLayer, Any };
 use futures::sink::SinkExt;
 use futures::stream::{ SplitSink, SplitStream, StreamExt };
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::{ self, error::SendError };
 use tokio::task::JoinHandle;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt };
+
 use serde::{ Deserialize, Serialize };
 //use std::collections::{ HashMap, HashSet };
 use std::sync::{ Arc, Mutex, MutexGuard };
 use std::net::TcpListener;
+use std::slice;
 use sqlx::{ FromRow, Pool };
 use sqlx::mysql::{ MySql, MySqlPoolOptions, };
 
@@ -43,6 +46,7 @@ struct ChatApp {
 struct Room {
     tx: broadcast::Sender<Option<String>>,
     users: Vec<String>,
+    connection: Vec<Contacts>,
 }
 
 #[derive(Deserialize)]
@@ -50,7 +54,7 @@ struct User {
     x500: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct UserContacts {
     x500: String, 
     first_name: Option<String>,
@@ -80,6 +84,15 @@ struct UserConnection {
     discord: Option<String>,
 }
 
+// struct ConnectionContacts<'a> {
+//     first_name: Option<&'a str>,
+//     last_name: Option<&'a str>,
+//     phone_number: Option<&'a str>,
+//     instagram: Option<&'a str>,
+//     snapchat: Option<&'a str>,
+//     discord: Option<&'a str>,
+// }
+
 // returned to the user on login or after they enter contacts
 // returned to all users connected with them on connections page
 #[derive(Debug, FromRow, Serialize)]
@@ -108,7 +121,7 @@ impl ClientEvent {
 impl Room {
 
     fn new(tx: broadcast::Sender<Option<String>>, x500: String) -> Self {
-        Room { tx: tx.clone(), users: vec![x500.to_owned()] }
+        Room { tx: tx.clone(), users: vec![x500.to_owned()], connection: Vec::new() }
     }
 
     fn remove_user(&mut self, x500: &str) -> &Self {
@@ -148,14 +161,20 @@ async fn main() {
 
     let app: Arc<ChatApp> = Arc::new(ChatApp { rooms: Mutex::new(Vec::new()), db: pool });
 
+    let cors: CorsLayer = CorsLayer::new()
+        .allow_methods(vec![Method::GET, Method::POST, Method::PATCH])
+        .allow_headers(Any)
+        .allow_origin(Any);
+
     let router: Router = Router::new()
         .route("/join", get(websocket_handler))
         .route("/get_contacts", get(get_contacts))
         .route("/new_contacts", post(new_contacts))
-        .route("/edit_contact", put(edit_contact))
+        .route("/edit_contact", patch(edit_contact))
         .route("/get_connections", get(get_connections))
         .route("/new_connection", get(new_connection))
-        .with_state(app);
+        .with_state(app)
+        .layer(cors);
 
     let listener: TcpListener = TcpListener::bind("127.0.0.1:3000").unwrap();
 
@@ -262,6 +281,8 @@ async fn new_contacts(State(app): State<Arc<ChatApp>>, extract::Json(contacts): 
         )
     ";
 
+    println!("{:#?}", contacts);
+
     let _ = sqlx::query(sql)
         .bind(contacts.x500)
         .bind(contacts.first_name)
@@ -347,7 +368,7 @@ async fn websocket_handler(
 
 }
 
-async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, /*contacts: Contacts*/) {
+async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /*contacts: Contacts*/) {
 
     let (mut sender, mut receiver) = stream.split();
 
@@ -377,11 +398,10 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, /*contact
     
         let tx_chat: broadcast::Sender<Option<String>> = tx.clone();
             
-        let mut recv_task: JoinHandle<(SplitStream<WebSocket>, bool)> = tokio::spawn(async move {
+        let mut recv_task: JoinHandle<(SplitStream<WebSocket>, Arc<ChatApp>, String, Vec<String>, bool)> = tokio::spawn(async move {
 
             let mut skipped: bool = false;
-            //let name = contacts.first_name.as_ref().map(|str| str.as_str()).unwrap_or("");
-                        
+ 
             while let Some(Ok(msg)) = receiver.next().await {
 
                 match msg {
@@ -392,21 +412,43 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, /*contact
                     }
                     Message::Binary(bytes) => {
 
-                        if let Some(event) = bytes.get(0).and_then(|u8| ClientEvent::from_u8(*u8)) {
+                        let mut bytes: slice::Iter<'_, u8> = bytes.iter();
+
+                        if let Some(event) = bytes.next().and_then(|u8| ClientEvent::from_u8(*u8)) {
                             match event {
                                 ClientEvent::Skip => {
+
+                                    let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                                    room.remove_user(&x500).skip_users(&mut skipped_users);
+
+                                    let result: Result<usize, SendError<Option<String>>> = tx.send(None);
+                                    
+                                    if result.is_err() {
+                                        break;
+                                    }
+
                                     skipped = true;
-                                    let _ = tx.send(None);
+
                                     break;
+
                                 }
                                 ClientEvent::Leave => {
+
+                                    let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                                    room.remove_user(&x500);
+
                                     break;
+
                                 },
                                 ClientEvent::Connect => {
-                                    //sqlx::query("SELECT * FROM contacts").fetch_all(&app.db);
+
+                                    let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+
+                                    //room.connection.push(Contacts { first_name: (), last_name: (), phone_number: (), instagram: (), snapchat: (), discord: () })
                                     
-                                    //let name: &String = &(contacts.first_name.unwrap_or("".to_owned())).clone();
-                                    //println!("{name}");
                                 },
                                 ClientEvent::ConnectDecline => {
 
@@ -420,64 +462,25 @@ async fn websocket(stream: WebSocket, app: Arc<ChatApp>, x500: String, /*contact
             
             }
     
-            (receiver, skipped)
+            (receiver, app, x500, skipped_users, skipped,)
     
         });
     
         tokio::select! {
-            _ = (&mut send_task) => {
-
-                recv_task.abort();
-
-                let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
-                let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-                room.remove_user(&x500);
-
-                break 'join_loop;  
-            }
+            
+            _ = (&mut send_task) => break 'join_loop recv_task.abort(),
             result = (&mut recv_task) => match result {
-                Err(_) => {
-
-                    send_task.abort();
-
-                    let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
-                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-                    room.remove_user(&x500);
-
-                    break 'join_loop;
-
-                },
-                Ok((_receiver, skipped)) => match skipped {
-                    false => {
-
-                        send_task.abort();
-
-                        let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
-                        let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-                        room.remove_user(&x500);
-
-                        break 'join_loop;
-
-                    },
+                Err(_) => break 'join_loop send_task.abort(),
+                Ok((_receiver, _app, _x500, _skipped_users, skipped)) => match skipped {
+                    false => break 'join_loop send_task.abort(),
                     true => match send_task.await {
-                        Err(_) => {
-
-                            let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
-                            let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-                            room.remove_user(&x500);
-
-                            break 'join_loop;
-
-                        }
+                        Err(_) => break 'join_loop,
                         Ok(_sender) => {
-
-                            let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
-                            let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-                            room.remove_user(&x500).skip_users(&mut skipped_users);
-
                             receiver = _receiver;
                             sender = _sender;
-
+                            app = _app;
+                            x500 = _x500;
+                            skipped_users = _skipped_users;
                         }
                     }
                 }
@@ -500,7 +503,7 @@ fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], x500: &str) -> 
 
     for optimal_user_count in (0..MAX_ROOM_SIZE).rev() { //test this
 
-        'room_loop: for (room_idx, Room { tx, users }) in rooms.iter_mut().enumerate() {
+        'room_loop: for (room_idx, Room { tx, users, .. }) in rooms.iter_mut().enumerate() {
 
             //println!("{room_idx}: {}, {}, {}", tx.receiver_count(), users.len(), optimal_user_count);
     
