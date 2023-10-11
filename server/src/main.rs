@@ -10,12 +10,10 @@ use futures::stream::{ SplitSink, SplitStream, StreamExt };
 use tokio::sync::broadcast::{ self, error::SendError };
 use tokio::task::JoinHandle;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt };
-
 use serde::{ Deserialize, Serialize };
-//use std::collections::{ HashMap, HashSet };
+//use std::collections::HashMap;
 use std::sync::{ Arc, Mutex, MutexGuard };
 use std::net::TcpListener;
-use std::slice;
 use sqlx::{ FromRow, Pool };
 use sqlx::mysql::{ MySql, MySqlPoolOptions, };
 
@@ -23,14 +21,16 @@ enum ClientEvent {
     Skip,
     Leave, 
     Connect,
-    ConnectDecline,
+    ConnectCancel,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", content = "content")]
 enum ServerEvent {
-    Join,
-    Leave,
+    Message(String, String),
+    Join(String),
+    Skip(String),
+    Leave(String),
     ConnectRequest,
     ConnectSuccess,
     ConnectFailure,
@@ -46,7 +46,7 @@ struct ChatApp {
 struct Room {
     tx: broadcast::Sender<Option<String>>,
     users: Vec<String>,
-    connection: Vec<Contacts>,
+    connection: Vec<Box<[u8]>>,
 }
 
 #[derive(Deserialize)]
@@ -84,15 +84,6 @@ struct UserConnection {
     discord: Option<String>,
 }
 
-// struct ConnectionContacts<'a> {
-//     first_name: Option<&'a str>,
-//     last_name: Option<&'a str>,
-//     phone_number: Option<&'a str>,
-//     instagram: Option<&'a str>,
-//     snapchat: Option<&'a str>,
-//     discord: Option<&'a str>,
-// }
-
 // returned to the user on login or after they enter contacts
 // returned to all users connected with them on connections page
 #[derive(Debug, FromRow, Serialize)]
@@ -104,6 +95,8 @@ struct Contacts {
     snapchat: Option<String>,
     discord: Option<String>,
 }
+
+struct SqlInsert(String);
 
 impl ClientEvent {
 
@@ -124,24 +117,85 @@ impl Room {
         Room { tx: tx.clone(), users: vec![x500.to_owned()], connection: Vec::new() }
     }
 
-    fn remove_user(&mut self, x500: &str) -> &Self {
+    fn remove_user(&mut self, x500: &str) {
         
         if let Some(idx) = self.users.iter().position(|x| *x == x500) {
             self.users.remove(idx);
+        }
+
+    }
+
+    fn skip_users(&self, skipped_users: &mut Vec<String>)  {
+        
+        for x500 in &self.users {
+            skipped_users.push(x500.to_owned());
+        }
+        
+    }
+
+}
+
+impl SqlInsert {
+    
+    fn new(table: &str, columns: Option<&str>) -> Self {
+        
+        let mut sql: String = format!("INSERT INTO {table} ");
+        
+        if let Some(columns) = columns {
+            sql.push('(');
+            sql.push_str(columns);
+            sql.push(')');
+        }
+
+        sql.push_str(" VALUES (");
+
+        SqlInsert(sql)
+
+    }
+
+    fn open(mut self, initial: &str) -> Self {
+
+        self.0.push('\"');
+        self.0.push_str(initial);
+        self.0.push('\"');
+
+        self
+
+    }
+
+    fn value(mut self, value: &str) -> Self {
+        
+        self.0.push(',');
+        self.0.push('\"');
+        self.0.push_str(value);
+        self.0.push('\"');
+
+        self
+
+    }
+
+    fn value_optional(mut self, value: Option<&str>) -> Self {
+
+        self.0.push(',');
+        
+        match value {
+            Some(value) => {
+                self.0.push('\"');
+                self.0.push_str(&value);
+                self.0.push('\"');
+            }
+            None => self.0.push_str("NULL"),
         }
 
         self
 
     }
 
-    fn skip_users(&self, skipped_users: &mut Vec<String>) -> &Self  {
-        
-        for x500 in &self.users {
-            skipped_users.push(x500.to_owned());
-        }
+    fn close(mut self) -> String {
 
-        self
-        
+        self.0.push(')');
+        self.0
+
     }
 
 }
@@ -190,10 +244,9 @@ async fn main() {
 
 async fn get_connections(Query(User { x500, }): Query<User>, State(app): State<Arc<ChatApp>>) -> Result<response::Json<Vec<Contacts>>, StatusCode> {
 
-    let sql: &str = "SELECT * FROM connections WHERE x500 = \"$1\"";
+    let sql: &str = &format!("SELECT * FROM connections WHERE x500 = \"{x500}\"");
     
     let connections: Vec<Contacts> = sqlx::query_as(sql)
-        .bind(x500)
         .fetch_all(&app.db)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -205,37 +258,22 @@ async fn get_connections(Query(User { x500, }): Query<User>, State(app): State<A
 // maybe use the app state room contacts to build connections instead of json
 async fn new_connection(State(app): State<Arc<ChatApp>>, extract::Json(connection): extract::Json<UserConnection>) -> Result<(), StatusCode> {
 
-    let sql: &str = "
-        INSERT INTO connections (
-            x500,
-            partner_x500,
-            first_name, 
-            last_name,
-            phone_number,
-            instagram,
-            snapchat, 
-            discord 
-        ) VALUES (
-            \"$1\",
-            \"$2\",
-            \"$3\",
-            \"$4\",
-            \"$5\",
-            \"$6\",
-            \"$7\",
-            \"$8\"
-        )
-    ";
+    let table: &str = "connections";
+
+    let columns: &str = "x500,partner_x500,first_name,last_name,phone_number,instagram,snapchat,discord";
+
+    let sql = &SqlInsert::new(table, Some(columns))
+        .open(&connection.x500)
+        .value(&connection.partner_x500)
+        .value_optional(connection.first_name.as_deref())
+        .value_optional(connection.last_name.as_deref())
+        .value_optional(connection.phone_number.as_deref())
+        .value_optional(connection.instagram.as_deref())
+        .value_optional(connection.snapchat.as_deref())
+        .value_optional(connection.discord.as_deref())
+        .close();
 
     sqlx::query(sql)
-        .bind(connection.x500)
-        .bind(connection.partner_x500)
-        .bind(connection.first_name)
-        .bind(connection.last_name)
-        .bind(connection.phone_number)
-        .bind(connection.instagram)
-        .bind(connection.snapchat)
-        .bind(connection.discord)
         .execute(&app.db)
         .await
         .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
@@ -246,10 +284,9 @@ async fn new_connection(State(app): State<Arc<ChatApp>>, extract::Json(connectio
 
 async fn get_contacts(Query(User { x500, }): Query<User>, State(app): State<Arc<ChatApp>>) -> Result<response::Json<Contacts>, StatusCode> {
 
-    let sql: &str = "SELECT * FROM contacts WHERE x500 = \"$1\"";
+    let sql: &str = &format!("SELECT * FROM contacts WHERE x500 = \"{x500}\"");
 
     let contacts: Contacts = sqlx::query_as(sql)
-        .bind(x500)
         .fetch_optional(&app.db)
         .await
         .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?
@@ -259,86 +296,54 @@ async fn get_contacts(Query(User { x500, }): Query<User>, State(app): State<Arc<
 
 }
 
-async fn new_contacts(State(app): State<Arc<ChatApp>>, extract::Json(contacts): extract::Json<UserContacts>) -> &'static str {
+async fn new_contacts(State(app): State<Arc<ChatApp>>, extract::Json(contacts): extract::Json<UserContacts>) -> Result<(), StatusCode> {
 
-    let sql: &str = "
-        INSERT INTO contacts (
-            x500,
-            first_name, 
-            last_name,
-            phone_number,
-            instagram,
-            snapchat, 
-            discord 
-        ) VALUES (
-            \"$1\",
-            \"$2\",
-            \"$3\",
-            \"$4\",
-            \"$5\",
-            \"$6\",
-            \"$7\"
-        )
-    ";
+    let table: &str = "contacts";
 
-    println!("{:#?}", contacts);
+    let columns: &str = "x500,first_name,last_name,phone_number,instagram,snapchat,discord";
 
-    let _ = sqlx::query(sql)
-        .bind(contacts.x500)
-        .bind(contacts.first_name)
-        .bind(contacts.last_name)
-        .bind(contacts.phone_number)
-        .bind(contacts.instagram)
-        .bind(contacts.snapchat)
-        .bind(contacts.discord)
+    let sql = &SqlInsert::new(table, Some(columns))
+        .open(&contacts.x500)
+        .value_optional(contacts.first_name.as_deref())
+        .value_optional(contacts.last_name.as_deref())
+        .value_optional(contacts.phone_number.as_deref())
+        .value_optional(contacts.instagram.as_deref())
+        .value_optional(contacts.snapchat.as_deref())
+        .value_optional(contacts.discord.as_deref())
+        .close();
+
+    let _ = sqlx::query(&sql)
         .execute(&app.db)
         .await
-        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY);
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
-    "hai"
-
-    //Ok(())
+    Ok(())
 
 }
 
-async fn edit_contact(Query(contact_update): Query<UserContactUpdate>, State(app): State<Arc<ChatApp>>) -> Result<(), StatusCode> {
+async fn edit_contact(Query(UserContactUpdate { x500, field, value }): Query<UserContactUpdate>, State(app): State<Arc<ChatApp>>) -> Result<(), StatusCode> {
 
-    match contact_update.field.as_str() {
-        "x500" | "first_name" | "last_name" | "phone_number" | "instagram" | "snapchat" | "discord" => Ok(()),
+    println!("{}", field.as_str());
+
+    match field.as_str() {
+        "first_name" | "last_name" | "phone_number" | "instagram" | "snapchat" | "discord" => Ok(()),
         _ => Err(StatusCode::NOT_ACCEPTABLE),
     }?;
 
-    let contact_deleted: bool = contact_update.value.is_none();
-
-    if contact_deleted {
-
-        let sql: &str = "
+    let sql: &str = &match value {
+        Some(value) => format!("
             UPDATE contacts 
-            SET $1 = \"$2\" 
-            WHERE x500 = NULL 
-        ";
-
-        sqlx::query(sql)
-            .bind(contact_update.x500)
-            .bind(contact_update.field)
-            .execute(&app.db)
-            .await
-            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-
-        return Ok(());
-
-    }
-
-    let sql: &str = "
-        UPDATE contacts 
-        SET $1 = \"$2\" 
-        WHERE x500 = \"$3\" 
-    ";
+            SET {field} = \"{value}\" 
+            WHERE x500 = \"{x500}\"
+        "),
+        None => format!("
+            UPDATE contacts 
+            SET {field} = NULL  
+            WHERE x500 = \"{x500}\"
+        "), 
+    };
 
     sqlx::query(sql)
-        .bind(contact_update.x500)
-        .bind(contact_update.field)
-        .bind(contact_update.value)
         .execute(&app.db)
         .await
         .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
@@ -383,13 +388,11 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
         let _ = tx.send(Some(msg));
     
         let mut send_task: JoinHandle<SplitSink<WebSocket, Message>> = tokio::spawn(async move {
-            
-            while let Ok(Some(msg)) = rx.recv().await {
 
+            while let Ok(Some(msg)) = rx.recv().await {
                 if sender.send(Message::Text(msg)).await.is_err() {
                     break;
                 }
-
             }
 
             return sender;
@@ -406,22 +409,18 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
 
                 match msg {
                     Message::Text(msg) => {
-        
                         let _ = tx_chat.send(Some(msg));
-
                     }
                     Message::Binary(bytes) => {
 
-                        let mut bytes: slice::Iter<'_, u8> = bytes.iter();
+                        let bytes: Box<[u8]> = bytes.into();
 
-                        if let Some(event) = bytes.next().and_then(|u8| ClientEvent::from_u8(*u8)) {
+                        if let Some(event) = bytes.get(0).and_then(|u8| ClientEvent::from_u8(*u8)) {
+
                             match event {
                                 ClientEvent::Skip => {
 
-                                    let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
-                                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-                                    room.remove_user(&x500).skip_users(&mut skipped_users);
-
+                                    // causes the ALL users in the room to leave (try sending the x500 with each msg to validate?)
                                     let result: Result<usize, SendError<Option<String>>> = tx.send(None);
                                     
                                     if result.is_err() {
@@ -435,22 +434,30 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
                                 }
                                 ClientEvent::Leave => {
 
-                                    let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
-                                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
-                                    room.remove_user(&x500);
-
                                     break;
 
                                 },
                                 ClientEvent::Connect => {
+                                    //once a user is connected, they will be locked on the client side from connecting until they cancel
 
                                     let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
                                     let room: &mut Room = rooms.get_mut(room_idx).unwrap();
 
-                                    //room.connection.push(Contacts { first_name: (), last_name: (), phone_number: (), instagram: (), snapchat: (), discord: () })
+                                    room.connection.push(bytes);
+
+                                    if room.connection.len() == MAX_ROOM_SIZE {
+                                        
+                                        // yippee (send connection to user)
+                                    }
                                     
                                 },
-                                ClientEvent::ConnectDecline => {
+                                ClientEvent::ConnectCancel => {
+                                    //can be used by the user who sent the connection to cancel a connection
+
+                                    let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                                    let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+
+                                    room.connection.clear();
 
                                 }
                             };
@@ -461,18 +468,42 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
                 }
             
             }
+
+            {
+
+                let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
+                let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                room.remove_user(&x500);
+
+                if skipped {
+                    room.skip_users(&mut skipped_users);
+                }
+
+                let _ = tx.send(Some("they gone 🥀".to_owned()));
+
+            }
     
-            (receiver, app, x500, skipped_users, skipped,)
+            (receiver, app, x500, skipped_users, skipped)
     
         });
     
         tokio::select! {
             
-            _ = (&mut send_task) => break 'join_loop recv_task.abort(),
+            _ = (&mut send_task) => {
+                //we will run into issues here
+                println!("send task ended CODE RED!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                break 'join_loop recv_task.abort()
+            },
             result = (&mut recv_task) => match result {
-                Err(_) => break 'join_loop send_task.abort(),
+                Err(_) => {
+                    //we may run into issues here too, but im not exactly sure
+                    println!("error in recv task");
+                    break 'join_loop send_task.abort()
+                },
                 Ok((_receiver, _app, _x500, _skipped_users, skipped)) => match skipped {
-                    false => break 'join_loop send_task.abort(),
+                    false => {
+                        break 'join_loop send_task.abort()
+                    },
                     true => match send_task.await {
                         Err(_) => break 'join_loop,
                         Ok(_sender) => {
@@ -499,13 +530,13 @@ fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], x500: &str) -> 
 
     let mut rooms: MutexGuard<'_, Vec<Room>> = rooms.lock().unwrap();
 
-    //println!("{:#?}", rooms);
+    println!("{:#?}", rooms);
 
     for optimal_user_count in (0..MAX_ROOM_SIZE).rev() { //test this
 
         'room_loop: for (room_idx, Room { tx, users, .. }) in rooms.iter_mut().enumerate() {
 
-            //println!("{room_idx}: {}, {}, {}", tx.receiver_count(), users.len(), optimal_user_count);
+            println!("{room_idx}: {}, {}, {}", tx.receiver_count(), users.len(), optimal_user_count);
     
             if tx.receiver_count() != optimal_user_count {
                 continue;
