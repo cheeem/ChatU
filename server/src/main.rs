@@ -7,7 +7,7 @@ use axum::Router;
 use tower_http::cors::{ CorsLayer, Any };
 use futures::sink::SinkExt;
 use futures::stream::{ SplitSink, SplitStream, StreamExt };
-use tokio::sync::broadcast::{ self, error::SendError };
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt };
 use serde::{ Deserialize, Serialize };
@@ -45,7 +45,7 @@ struct ChatApp {
 struct Room {
     tx: broadcast::Sender<ServerEvent>,
     users: Vec<String>,
-    connection: Vec<Box<[u8]>>,
+    connection: Vec<Arc<UserContacts>>,
 }
 
 #[derive(Deserialize)]
@@ -83,8 +83,6 @@ struct UserConnection {
     discord: Option<String>,
 }
 
-// returned to the user on login or after they enter contacts
-// returned to all users connected with them on connections page
 #[derive(Debug, FromRow, Serialize)]
 struct Contacts {
     first_name: Option<String>,
@@ -97,6 +95,14 @@ struct Contacts {
 
 struct SqlInsert(String);
 
+struct OwnedReceiverTaskState {
+    receiver: SplitStream<WebSocket>, 
+    app: Arc<ChatApp>, 
+    x500: String, 
+    contacts: Arc<UserContacts>,
+    skipped_users: Vec<String>,
+}
+
 impl ClientEvent {
 
     fn from_u8(u8: u8) -> Option<Self> {
@@ -104,6 +110,7 @@ impl ClientEvent {
             0 => Some(ClientEvent::Skip),
             1 => Some(ClientEvent::Leave),
             2 => Some(ClientEvent::Connect),
+            3 => Some(ClientEvent::ConnectCancel),
             _ => None,
         }
     }
@@ -352,26 +359,18 @@ async fn edit_contact(Query(UserContactUpdate { x500, field, value }): Query<Use
 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
-    Query(user_contacts): Query<UserContacts>, 
+    Query(contacts): Query<UserContacts>, 
     State(state): State<Arc<ChatApp>>,
 ) -> impl IntoResponse {
 
-    let x500: String = user_contacts.x500;
+    let x500: String = contacts.x500.to_owned();
+    let contacts: Arc<UserContacts> = Arc::new(contacts);
 
-    let contacts: Contacts = Contacts {
-        first_name: user_contacts.first_name,
-        last_name: user_contacts.last_name,
-        phone_number: user_contacts.phone_number,
-        instagram: user_contacts.instagram,
-        snapchat: user_contacts.snapchat,
-        discord: user_contacts.discord,
-    };
-
-    ws.on_upgrade(|socket| websocket(socket, state, x500, /*contacts*/))
+    ws.on_upgrade(|socket| websocket(socket, state, x500, contacts))
 
 }
 
-async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /*contacts: Contacts*/) {
+async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, mut contacts: Arc<UserContacts>) {
 
     let (mut sender, mut receiver) = stream.split();
 
@@ -419,9 +418,9 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
 
         });
     
-        let tx_chat: broadcast::Sender<ServerEvent> = tx.clone();
+        //let chat: broadcast::Sender<ServerEvent> = tx.clone();
             
-        let mut recv_task: JoinHandle<(SplitStream<WebSocket>, Arc<ChatApp>, String, Vec<String>, bool)> = tokio::spawn(async move {
+        let mut recv_task: JoinHandle<(OwnedReceiverTaskState, bool)> = tokio::spawn(async move {
 
             let mut skipped: bool = false;
  
@@ -429,7 +428,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
 
                 match msg {
                     Message::Text(content) => {
-                        let _ = tx_chat.send(ServerEvent::Message { user_idx, content });
+                        let _ = tx.send(ServerEvent::Message { user_idx, content });
                     }
                     Message::Binary(bytes) => {
 
@@ -440,9 +439,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
                             match event {
                                 ClientEvent::Skip => {
 
-                                    let result: Result<usize, SendError<ServerEvent>> = tx.send(ServerEvent::Skip { user_idx });
-                                    
-                                    if result.is_err() {
+                                    if tx.send(ServerEvent::Skip { user_idx }).is_err() {
                                         break;
                                     }
 
@@ -455,17 +452,31 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
                                     break;
                                 },
                                 ClientEvent::Connect => {
-                                    //once a user is connected, they will be locked on the client side from connecting until they cancel
+                                    //once a user is connected, they will be locked from connecting until they cancel
 
                                     let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
                                     let room: &mut Room = rooms.get_mut(room_idx).unwrap();
 
-                                    room.connection.push(bytes); // we need to send the actual contact info
+                                    let user_is_unconnected: bool = !room.connection.iter().any(|contacts| contacts.x500 == x500);
 
-                                    if room.connection.len() == MAX_ROOM_SIZE {
-                                        
-                                        // yippee (send connection to user)
+                                    if user_is_unconnected {
+                                        // we need to filter out contacts that the user doesn't want to share given the bytes sent
+                                        room.connection.push(Arc::clone(&contacts));
                                     }
+
+                                    let all_users_connected: bool = room.connection.len() == room.users.len();
+
+                                    if all_users_connected {
+
+                                        let _ = tx.send(ServerEvent::ConnectSuccess);
+                                        
+                                        continue;
+                                        
+                                        // storing new connections should be done either in the send task or as part of a seperate post request made by the client after receiving the successful connection 
+
+                                    }
+
+                                    let _ = tx.send(ServerEvent::ConnectRequest);
                                     
                                 },
                                 ClientEvent::ConnectCancel => {
@@ -475,6 +486,8 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
                                     let room: &mut Room = rooms.get_mut(room_idx).unwrap();
 
                                     room.connection.clear();
+
+                                    let _ = tx.send(ServerEvent::ConnectFailure);
 
                                 }
                             };
@@ -487,20 +500,21 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
             }
 
             {
-
                 let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
                 let room: &mut Room = rooms.get_mut(room_idx).unwrap();
+                
                 room.remove_user(&x500);
 
                 if skipped {
                     room.skip_users(&mut skipped_users);
                 }
 
-                let _ = tx.send(ServerEvent::Leave { user_idx });
+                room.connection.clear();
 
+                let _ = tx.send(ServerEvent::Leave { user_idx });
             }
     
-            (receiver, app, x500, skipped_users, skipped)
+            (OwnedReceiverTaskState { receiver, app, x500, contacts, skipped_users, }, skipped)
     
         });
     
@@ -508,27 +522,27 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, /
             
             _ = (&mut send_task) => {
                 //we will run into issues here
-                println!("send task ended CODE RED!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                println!("⚠️ Send Task Ended Too Early");
                 break 'join_loop recv_task.abort()
             },
             result = (&mut recv_task) => match result {
                 Err(_) => {
-                    //we may run into issues here too, but im not exactly sure
-                    println!("error in recv task");
+                    println!("⚠️ Error in Recv Task");
                     break 'join_loop send_task.abort()
                 },
-                Ok((_receiver, _app, _x500, _skipped_users, skipped)) => match skipped {
+                Ok((state, skipped)) => match skipped {
                     false => {
                         break 'join_loop send_task.abort()
                     },
                     true => match send_task.await {
                         Err(_) => break 'join_loop,
                         Ok(_sender) => {
-                            receiver = _receiver;
                             sender = _sender;
-                            app = _app;
-                            x500 = _x500;
-                            skipped_users = _skipped_users;
+                            receiver = state.receiver;
+                            app = state.app;
+                            x500 = state.x500;
+                            contacts = state.contacts;
+                            skipped_users = state.skipped_users;
                         }
                     }
                 }
@@ -549,7 +563,7 @@ fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], x500: &str) -> 
 
     println!("{:#?}", rooms);
 
-    for optimal_user_count in (0..MAX_ROOM_SIZE).rev() { //test this
+    for optimal_user_count in (0..MAX_ROOM_SIZE).rev() {
 
         'room_loop: for (room_idx, Room { tx, users, .. }) in rooms.iter_mut().enumerate() {
 
