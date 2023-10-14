@@ -26,13 +26,13 @@ enum ClientEvent {
 
 #[derive(Serialize, Clone)]
 #[serde(tag = "type", content = "data")]
-enum ServerEvent {
+enum ServerEvent { // maybe these should be serialized before sending to all users so we're just sending a string?
     Message { user_idx: usize, content: String, },
     Join { user_idx: usize },
     Skip { user_idx: usize },
     Leave { user_idx: usize },
-    ConnectRequest,
-    ConnectSuccess,
+    ConnectRequest /*{ contact_fields: Arc<[ContactField]> }*/,
+    ConnectSuccess { contacts: Arc<[UserContacts]> },
     ConnectFailure,
 }
 
@@ -45,7 +45,7 @@ struct ChatApp {
 struct Room {
     tx: broadcast::Sender<ServerEvent>,
     users: Vec<String>,
-    connection: Vec<Arc<UserContacts>>,
+    connection: Option<Vec<UserContacts>>,
 }
 
 #[derive(Deserialize)]
@@ -53,7 +53,7 @@ struct User {
     x500: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct UserContacts {
     x500: String, 
     first_name: Option<String>,
@@ -62,6 +62,16 @@ struct UserContacts {
     instagram: Option<String>,
     snapchat: Option<String>,
     discord: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+enum ContactField {
+    FirstName,
+    LastName,
+    PhoneNumber,
+    Instagram,
+    Snapchat, 
+    Discord,
 }
 
 #[derive(Deserialize)]
@@ -99,7 +109,7 @@ struct OwnedReceiverTaskState {
     receiver: SplitStream<WebSocket>, 
     app: Arc<ChatApp>, 
     x500: String, 
-    contacts: Arc<UserContacts>,
+    contacts: UserContacts,
     skipped_users: Vec<String>,
 }
 
@@ -119,8 +129,8 @@ impl ClientEvent {
 
 impl Room {
 
-    fn new(tx: broadcast::Sender<ServerEvent>, x500: String) -> Self {
-        Room { tx: tx.clone(), users: vec![x500.to_owned()], connection: Vec::new() }
+    fn new(tx: broadcast::Sender<ServerEvent>) -> Self {
+        Room { tx, users: Vec::new(), connection: None, }
     }
 
     fn remove_user(&mut self, x500: &str) {
@@ -364,13 +374,12 @@ async fn websocket_handler(
 ) -> impl IntoResponse {
 
     let x500: String = contacts.x500.to_owned();
-    let contacts: Arc<UserContacts> = Arc::new(contacts);
 
     ws.on_upgrade(|socket| websocket(socket, state, x500, contacts))
 
 }
 
-async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, mut contacts: Arc<UserContacts>) {
+async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, mut contacts: UserContacts) {
 
     let (mut sender, mut receiver) = stream.split();
 
@@ -385,13 +394,15 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
         let mut send_task: JoinHandle<SplitSink<WebSocket, Message>> = tokio::spawn(async move {
 
             while let Ok(event) = rx.recv().await {
-                
+
+                // probably want to serialize this inside the revc task instead
+                                
                 let msg: String = match event {
                     ServerEvent::Message { user_idx: _, content } => {
                         content
                     },
                     ServerEvent::Join { user_idx } => {
-                        format!("user {user_idx} joined") //break this out into a proper enum implementation 
+                        format!("user {user_idx} joined") // break this out into a proper enum implementation 
                     },
                     ServerEvent::Leave { user_idx } => {
                        format!("user {user_idx} left")
@@ -419,7 +430,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
         });
     
         //let chat: broadcast::Sender<ServerEvent> = tx.clone();
-            
+        
         let mut recv_task: JoinHandle<(OwnedReceiverTaskState, bool)> = tokio::spawn(async move {
 
             let mut skipped: bool = false;
@@ -432,9 +443,9 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                     }
                     Message::Binary(bytes) => {
 
-                        let bytes: Box<[u8]> = bytes.into();
+                        let mut bytes = bytes.iter();
 
-                        if let Some(event) = bytes.get(0).and_then(|u8| ClientEvent::from_u8(*u8)) {
+                        if let Some(event) = bytes.next().and_then(|u8| ClientEvent::from_u8(*u8)) {
 
                             match event {
                                 ClientEvent::Skip => {
@@ -452,23 +463,45 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                                     break;
                                 },
                                 ClientEvent::Connect => {
-                                    //once a user is connected, they will be locked from connecting until they cancel
+                                    // once a user is connected, they will be locked from connecting until they cancel
 
                                     let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
                                     let room: &mut Room = rooms.get_mut(room_idx).unwrap();
 
-                                    let user_is_unconnected: bool = !room.connection.iter().any(|contacts| contacts.x500 == x500);
+                                    let first_connection: bool = room.connection.is_none();
 
-                                    if user_is_unconnected {
-                                        // we need to filter out contacts that the user doesn't want to share given the bytes sent
-                                        room.connection.push(Arc::clone(&contacts));
+                                    if first_connection {
+                                        room.connection = Some(Vec::new());
                                     }
 
-                                    let all_users_connected: bool = room.connection.len() == room.users.len();
+                                    let user_is_unconnected: bool = first_connection || !room.connection.as_ref().unwrap().iter().any(|contacts| contacts.x500 == x500);
+
+                                    if user_is_unconnected {
+
+                                        // maybe move this into a UserContacts impl function
+                                        //try and see if there's a way to avoid copying data until a connection is made
+
+                                        room.connection.as_mut().unwrap().push(UserContacts { 
+                                            x500: x500.to_owned(),
+                                            first_name: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.first_name.to_owned()),
+                                            last_name: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.last_name.to_owned()),
+                                            phone_number: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.phone_number.to_owned()),
+                                            instagram: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.instagram.to_owned()), 
+                                            snapchat: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.snapchat.to_owned()),
+                                            discord: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.discord.to_owned()),
+                                        });
+
+                                    }
+
+                                    let all_users_connected: bool = !first_connection || room.connection.as_mut().unwrap().len() == room.users.len();
 
                                     if all_users_connected {
 
-                                        let _ = tx.send(ServerEvent::ConnectSuccess);
+                                        let contacts: Vec<UserContacts> = room.connection.take().unwrap();
+
+                                        let _ = tx.send(ServerEvent::ConnectSuccess { contacts: contacts.into() });
+
+                                        room.connection = Some(Vec::new());
                                         
                                         continue;
                                         
@@ -485,7 +518,9 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                                     let rooms: &mut [Room] = &mut *app.rooms.lock().unwrap();
                                     let room: &mut Room = rooms.get_mut(room_idx).unwrap();
 
-                                    room.connection.clear();
+                                    if room.connection.is_some() {
+                                        room.connection.as_mut().unwrap().clear();
+                                    }
 
                                     let _ = tx.send(ServerEvent::ConnectFailure);
 
@@ -509,7 +544,9 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                     room.skip_users(&mut skipped_users);
                 }
 
-                room.connection.clear();
+                if room.connection.is_some() {
+                    room.connection.as_mut().unwrap().clear();
+                }
 
                 let _ = tx.send(ServerEvent::Leave { user_idx });
             }
@@ -593,7 +630,11 @@ fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], x500: &str) -> 
 
     let room_idx: usize = rooms.len();
 
-    rooms.push(Room::new(tx.clone(), x500.to_owned()));
+    let mut room: Room = Room::new(tx.clone());
+
+    room.users.push(x500.to_owned());
+
+    rooms.push(room);
 
     let user_idx: usize = 0;
 
