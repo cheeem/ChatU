@@ -1,6 +1,14 @@
 import "./app.css";
+
 import { createRef, } from "preact";
-import { signal, effect, Signal, } from "@preact/signals";
+import { signal, Signal, } from "@preact/signals";
+import { useState } from "preact/hooks";
+import { SetStateAction } from "preact/compat";
+
+import { nanoid } from "nanoid";
+
+import Join from "./main/join";
+import Chat from "./main/join";
 
 const CLIENT_EVENT_MAP = {
 	"SKIP": 0,
@@ -9,72 +17,64 @@ const CLIENT_EVENT_MAP = {
 } as const;
 
 type ClientEvent = keyof typeof CLIENT_EVENT_MAP;
+type MainState = "join" | "chat";
 
-export function App() {
+const x500: string = nanoid(8);
 
-	const websocket: Signal<WebSocket | null> = signal(null);
-	const joined: Signal<boolean> = signal(false);
-	const messages: Signal<string> = signal("");
+const websocket: Signal<WebSocket | null> = signal(null);
+const messages: Signal<string> = signal("");
+const mainState: Signal<MainState> = signal("join");
 
-	const userid = createRef<HTMLInputElement>();
+export default function App() {
+
 	const text = createRef<HTMLInputElement>();
 
-	effect(() => {
+	if(mainState.value === "chat") {
 
-		if(!websocket.value) {
-			return;
-		}
+		return (
+			<>
+	
+				<textarea id="messages" cols={30} rows={10}
+					value={messages}
+				></textarea>
+	
+				<input placeholder="type something..." 
+					ref={text}
+					onKeyDown={(e) => e.key === "Enter" && message(websocket, text.current!)} 
+				/>
+	
+				<button type="button"
+					onClick={() => message(websocket, text.current!)}
+				> Send </button>
+	
+				<button type="button"
+					onClick={() => event(websocket, "SKIP")}
+				> Skip </button>
+	
+				<button type="button"
+					onClick={() => event(websocket, "LEAVE")}
+				> Leave </button>
+	
+				<button type="button"
+					onClick={() => event(websocket, "CONNECT")}
+				> Connect </button>
+	
+			</>
+		);
+	
+	}
 
-		websocket.value.onclose = () => leave(joined);
-		websocket.value.onmessage = (e: MessageEvent) => messageReceived(e, messages);
+	return <button type="button" 
+		onClick={() => join(websocket, mainState, messages, x500)}
+	> Join Chat </button>
 
-	});
-
-	return (
-		<>
-
-			<input type="text" placeholder="userid"
-				ref={userid} 
-				disabled={joined}
-			/>
-
-			<button type="button" 
-				disabled={joined}
-				onClick={() => join(websocket, joined, userid.current!.value)}
-			> Join Chat </button>
-
-			<textarea id="messages" cols={30} rows={10}
-				value={messages}
-			></textarea>
-
-			<input placeholder="type something..." 
-				ref={text}
-				disabled={!joined} 
-				onKeyDown={(e) => e.key !== "Enter" && message(websocket, text.current!)} 
-			/>
-
-			<button type="button"
-				disabled={!joined} 
-				onClick={() => message(websocket, text.current!)}
-			> Send </button>
-
-			<button type="button"
-				disabled={!joined} 
-				onClick={() => event(websocket, "SKIP")}
-			> Skip </button>
-
-			<button type="button"
-				disabled={!joined} 
-				onClick={() => event(websocket, "LEAVE")}
-			> Leave </button>
-
-			<button type="button"
-				disabled={!joined} 
-				onClick={() => event(websocket, "CONNECT")}
-			> Connect </button>
-
-		</>
-	);
+	// return <Join 
+	// 	join={join} 
+	// 	websocket={websocket} 
+	// 	mainState={mainState}
+	// 	messages={messages} 
+	// 	x500={x500} 
+	// />;
 
 }
 
@@ -90,9 +90,11 @@ function event(websocket: Signal<WebSocket | null>, event: ClientEvent) {
 
 }
 
-function leave(joined: Signal<boolean>) {
+function leave(websocket: Signal<WebSocket | null>, mainState: Signal<MainState>) {
 	
-	joined.value = false;
+	websocket.value = null;
+
+	mainState.value = "join";
 	
 }
 
@@ -114,13 +116,16 @@ function message(websocket: Signal<WebSocket | null>, input: HTMLInputElement) {
 
 }
 
-function join(websocket: Signal<WebSocket | null>, joined: Signal<boolean>, userid: string) {
+function join(websocket: Signal<WebSocket | null>, mainState: Signal<MainState>, messages: Signal<string>, x500: string) {
 
-	if(joined.value) {
-		return;
-	}
+	console.log("hi")
 
-	websocket.value = new WebSocket(`ws://localhost:3000/join?id=${userid}`);
-	joined.value = true;
+	websocket.value = new WebSocket(`ws://localhost:3000/join?x500=${x500}`);
+	websocket.value.onclose = () => leave(websocket, mainState);
+	websocket.value.onmessage = (e: MessageEvent) => messageReceived(e, messages);
+
+	mainState.value = "chat";
+
+	console.log(websocket.value, mainState.value)
 
 }
