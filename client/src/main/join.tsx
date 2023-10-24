@@ -1,3 +1,5 @@
+import "./join.css";
+
 import { join } from "../websocket";
 import { WebsocketSignal, MessagesSignal, UserIndexSignal, MainStateSignal } from "../app";
 
@@ -16,7 +18,6 @@ export default function Join({ websocket, messages, userIndex, mainState, x500 }
 				onClick={() => join(websocket, messages, userIndex, mainState, x500)}
 			> Join Chat 
 			</button>
-			<p> {mainState.value === "loading" ? "loading" : ""} </p>
 		</div>
     );
 

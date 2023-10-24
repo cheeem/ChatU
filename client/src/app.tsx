@@ -38,15 +38,21 @@ export default function App() {
 	
 	}
 
-	return (
-		<Join 
-			websocket={websocket} 
-			messages={messages} 
-			userIndex={userIndex} 
-			mainState={mainState} 
-			x500={x500} 
-		/>
-	);
+	if(mainState.value === "loading") {
+		return <p> loading... </p>
+	}
+
+	if(mainState.value === "join") {
+		return (
+			<Join 
+				websocket={websocket} 
+				messages={messages} 
+				userIndex={userIndex} 
+				mainState={mainState} 
+				x500={x500} 
+			/>
+		);
+	}
 
 }
 
