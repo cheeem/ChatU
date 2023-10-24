@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt };
 use serde::{ Deserialize, Serialize };
-//use std::collections::HashMap;
+use serde_json;
 use std::sync::{ Arc, Mutex, MutexGuard };
 use std::net::TcpListener;
 use sqlx::{ FromRow, Pool };
@@ -24,15 +24,21 @@ enum ClientEvent {
     ConnectCancel,
 }
 
+#[derive(Clone)]
+enum SendEvent {
+    ServerEvent(String),
+    SkipEvent(usize),
+}
+
 #[derive(Serialize, Clone)]
 #[serde(tag = "type", content = "data")]
 enum ServerEvent { // maybe these should be serialized before sending to all users so we're just sending a string?
     Message { user_idx: usize, content: String, },
-    Join { user_idx: usize },
-    Skip { user_idx: usize },
-    Leave { user_idx: usize },
+    Join(usize),
+    Skip(usize),
+    Leave(usize),
     ConnectRequest /*{ contact_fields: Arc<[ContactField]> }*/,
-    ConnectSuccess { contacts: Arc<[UserContacts]> },
+    ConnectSuccess(Arc<[UserContacts]>),
     ConnectFailure,
 }
 
@@ -43,7 +49,7 @@ struct ChatApp {
 
 #[derive(Debug)]
 struct Room {
-    tx: broadcast::Sender<ServerEvent>,
+    tx: broadcast::Sender<SendEvent>,
     users: Vec<String>,
     connection: Option<Vec<UserContacts>>,
 }
@@ -127,9 +133,21 @@ impl ClientEvent {
 
 }
 
+impl ServerEvent {
+
+    // errors unhandled
+    fn send(&self, tx: &broadcast::Sender<SendEvent>) {
+        match serde_json::to_string(self) {
+            Ok(json) => { let _ = tx.send(SendEvent::ServerEvent(json)); },
+            Err(error) => (),
+        }
+    }
+
+}
+
 impl Room {
 
-    fn new(tx: broadcast::Sender<ServerEvent>) -> Self {
+    fn new(tx: broadcast::Sender<SendEvent>) -> Self {
         Room { tx, users: Vec::new(), connection: None, }
     }
 
@@ -227,7 +245,9 @@ async fn main() {
         .init();
 
     let pool: Pool<MySql> = MySqlPoolOptions::new()
-        .connect("mysql://cheemie:ex_pw@localhost:3306/chatu").await.unwrap();
+        .connect("mysql://cheemie:ex_pw@localhost:3306/chatu")
+        .await
+        .unwrap();
 
     let app: Arc<ChatApp> = Arc::new(ChatApp { rooms: Mutex::new(Vec::new()) });
 
@@ -388,39 +408,32 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
     'join_loop: loop {
 
         let (tx, mut rx, room_idx, user_idx) = find_room(&app.rooms, &skipped_users, &x500);
+
+        if sender.send(Message::Text(room_idx.to_string())).await.is_err() {
+            return;
+        }
     
-        let _ = tx.send(ServerEvent::Join { user_idx });
+        let _ = tx.send(SendEvent::ServerEvent(serde_json::to_string::<ServerEvent>(&ServerEvent::Join(user_idx)).unwrap()));
     
         let mut send_task: JoinHandle<SplitSink<WebSocket, Message>> = tokio::spawn(async move {
 
             while let Ok(event) = rx.recv().await {
 
                 // probably want to serialize this inside the revc task instead
-                                
-                let msg: String = match event {
-                    ServerEvent::Message { user_idx: _, content } => {
-                        content
-                    },
-                    ServerEvent::Join { user_idx } => {
-                        format!("user {user_idx} joined") // break this out into a proper enum implementation 
-                    },
-                    ServerEvent::Leave { user_idx } => {
-                       format!("user {user_idx} left")
-                    },
-                    ServerEvent::Skip { user_idx: idx } => {
 
+                match event {
+                    SendEvent::SkipEvent(idx) => {
                         if user_idx == idx {
                             break;
                         }
 
                         continue;
-                        
-                    },
-                    _ => continue,
-                };
-
-                if sender.send(Message::Text(msg)).await.is_err() {
-                    break;
+                    }
+                    SendEvent::ServerEvent(json) => {
+                        if sender.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
 
             }
@@ -428,9 +441,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
             return sender;
 
         });
-    
-        //let chat: broadcast::Sender<ServerEvent> = tx.clone();
-        
+            
         let mut recv_task: JoinHandle<(OwnedReceiverTaskState, bool)> = tokio::spawn(async move {
 
             let mut skipped: bool = false;
@@ -439,7 +450,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
 
                 match msg {
                     Message::Text(content) => {
-                        let _ = tx.send(ServerEvent::Message { user_idx, content });
+                        ServerEvent::Message { user_idx, content }.send(&tx);
                     }
                     Message::Binary(bytes) => {
 
@@ -450,7 +461,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                             match event {
                                 ClientEvent::Skip => {
 
-                                    if tx.send(ServerEvent::Skip { user_idx }).is_err() {
+                                    if tx.send(SendEvent::SkipEvent(user_idx)).is_err() {
                                         break;
                                     }
 
@@ -499,7 +510,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
 
                                         let contacts: Vec<UserContacts> = room.connection.take().unwrap();
 
-                                        let _ = tx.send(ServerEvent::ConnectSuccess { contacts: contacts.into() });
+                                        ServerEvent::ConnectSuccess(contacts.into()).send(&tx);
 
                                         room.connection = Some(Vec::new());
                                         
@@ -509,7 +520,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
 
                                     }
 
-                                    let _ = tx.send(ServerEvent::ConnectRequest);
+                                    ServerEvent::ConnectRequest.send(&tx);
                                     
                                 },
                                 ClientEvent::ConnectCancel => {
@@ -522,7 +533,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                                         room.connection.as_mut().unwrap().clear();
                                     }
 
-                                    let _ = tx.send(ServerEvent::ConnectFailure);
+                                    ServerEvent::ConnectFailure.send(&tx);
 
                                 }
                             };
@@ -548,7 +559,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                     room.connection.as_mut().unwrap().clear();
                 }
 
-                let _ = tx.send(ServerEvent::Leave { user_idx });
+                ServerEvent::Leave(user_idx).send(&tx);
             }
     
             (OwnedReceiverTaskState { receiver, app, x500, contacts, skipped_users, }, skipped)
@@ -594,7 +605,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
 
 }
 
-fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], x500: &str) -> (broadcast::Sender<ServerEvent>, broadcast::Receiver<ServerEvent>, usize, usize) {
+fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], x500: &str) -> (broadcast::Sender<SendEvent>, broadcast::Receiver<SendEvent>, usize, usize) {
 
     let mut rooms: MutexGuard<'_, Vec<Room>> = rooms.lock().unwrap();
 
@@ -626,7 +637,7 @@ fn find_room(rooms: &Mutex<Vec<Room>>, skipped_users: &[String], x500: &str) -> 
 
     }
 
-    let (tx, rx) = broadcast::channel::<ServerEvent>(2);
+    let (tx, rx) = broadcast::channel::<SendEvent>(2);
 
     let room_idx: usize = rooms.len();
 
