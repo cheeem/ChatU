@@ -1,0 +1,50 @@
+#chat {
+    overflow: auto;
+    
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 3em;
+
+    padding: 0 10vw;
+
+    height: 100%;
+}
+
+#display {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: end;
+    gap: 0.5em;
+}
+
+#display li {
+    padding: 0.5em;
+
+    border: 0.1em solid var(--user-color, black);
+}
+
+#display .left {
+    align-self: flex-start;
+}
+
+#display .right {
+    align-self: flex-end;
+}
+
+#actions {
+    display: flex;
+}
+
+#actions input {
+    flex: 1;
+    padding: 0.5em;
+}
+
+#actions button {
+    padding: 0.5em;
+
+    background-color: transparent;
+
+    cursor: pointer;
+}
