@@ -1,6 +1,10 @@
 #chat {
+    overflow: auto;
+    
+    flex: 1 1 50em;
     display: flex;
-    flex-direction: column;
+    flex-direction: column-reverse;
+    gap: 3em;
 
     height: 100%;
 }
@@ -13,12 +17,6 @@
     gap: 0.5em;
 }
 
-#display li {
-    padding: 0.5em;
-
-    border: 0.1em solid black;
-}
-
 #display .left {
     align-self: flex-start;
 }
@@ -27,19 +25,21 @@
     align-self: flex-end;
 }
 
+#display .message {
+    padding: 0.5em;
+
+    border: 0.1em solid var(--user-color, var(--neutral2));
+}
+
+#display .join, #display, .leave {
+    color: var(--user-color);
+}
+
 #actions {
     display: flex;
 }
 
 #actions input {
     flex: 1;
-    padding: 0.5em;
-}
-
-#actions button {
-    padding: 0.5em;
-
-    background-color: transparent;
-
-    cursor: pointer;
+    padding: 0.5em max(0.5em, 2%);
 }

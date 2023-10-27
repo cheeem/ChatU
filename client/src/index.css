@@ -21,3 +21,77 @@
 html, body, #app {
     height: 100%;
 }
+
+input, button {
+    padding: 0.5em;
+
+    font-size: 1em;
+
+    background-color: var(--neutral1);
+    
+    border: 0.1em solid var(--neutral2);
+
+    outline: none;
+}
+
+button {
+    cursor: pointer;
+
+    transition: 
+        background-color 0.2s ease, 
+        color 0.2s ease;
+}
+
+button:hover {
+    background-color: var(--neutral2);
+
+    color: var(--neutral1);
+}
+
+form {
+    display: grid;
+    gap: 1.5em;
+
+    background-color: var(--neutral1);
+}
+
+form ul {
+    display: grid; 
+    gap: 1.5em;
+}
+
+form ul li {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+}
+
+input[type="checkbox"] {
+    height: 1em;
+    width: 1em;
+}
+
+input[type="text"] {
+    width: 100%;
+}
+
+input[type="text"] ~ label {
+    position: absolute;
+    top: -0.8em;
+    left: calc(0.5em + 0.1em);
+
+    background-color: var(--neutral1);
+
+    pointer-events: none;
+
+    transition: top 0.2s ease;
+}
+
+input[type="text"]:placeholder-shown ~ label {
+    top: calc(0.5em + 0.1em);
+}
+
+input[type="text"]:focus ~ label {
+    top: -0.8em;
+}

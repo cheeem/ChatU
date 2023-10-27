@@ -4,55 +4,41 @@ import { signal, Signal, } from "@preact/signals";
 
 import { nanoid } from "nanoid";
 
+//main
 import Join from "./main/join";
 import Chat from "./main/chat";
 
+//sidebar
+import Connect from "./sidebar/connect";
+
+import { Contacts } from "./contacts";
+
 export type MainState = "join" | "chat" | "loading";
+export type ConnectState = "new" | "sent" | "request" | "success" | "failure";
 
-export type Message = { user_idx: number, content: string, };
-
-export type WebsocketSignal = Signal<WebSocket | null>;
-export type MessagesSignal = Signal<Message[]>;
-export type UserIndexSignal = Signal<number | null>;
-export type MainStateSignal = Signal<MainState>;
-
-const x500: string = nanoid(8);
-
-const websocket: WebsocketSignal = signal(null);
-const messages: MessagesSignal = signal([]);
-const userIndex: UserIndexSignal = signal(null);
-const mainState: MainStateSignal = signal("join");
+export const x500: string = nanoid(8);
+export const contacts: Signal<Contacts> = signal({})
+export const websocket: Signal<WebSocket | null> = signal(null);
+export const messages: Signal<preact.JSX.Element[]> = signal([]);
+export const userIndex: Signal<number | null> = signal(null);
+export const mainState: Signal<MainState> = signal("join");
+export const connectState: Signal<ConnectState> = signal("new");
 
 export default function App() {
 
 	if(mainState.value === "chat") {
-
-		return (
-			<Chat
-				websocket={websocket}
-				messages={messages}
-				userIndex={userIndex}
-				mainState={mainState}
-			/>
-		);
-	
+		return <> <Chat /> <Connect /> </>;
 	}
 
 	if(mainState.value === "loading") {
-		return <p> loading... </p>
+		return <> <div id="loading"> <p> loading... </p> </div> </>
 	}
 
 	if(mainState.value === "join") {
-		return (
-			<Join 
-				websocket={websocket} 
-				messages={messages} 
-				userIndex={userIndex} 
-				mainState={mainState} 
-				x500={x500} 
-			/>
-		);
+		return <> <Join /> </>;
 	}
+
+	return <> 404 </>;
 
 }
 

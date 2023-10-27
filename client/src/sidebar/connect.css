@@ -1,0 +1,14 @@
+#connect {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5em;
+}
+
+#connect h3 {
+    font-size: 1.5em;
+}
+
+#connect p {
+    font-weight: 500;
+    font-size: 1.1em;
+}
