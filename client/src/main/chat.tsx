@@ -2,8 +2,15 @@ import "./chat.css";
 
 import { createRef } from "preact";
 
-import { websocket, messages } from "../app";
-import { message, sendEvent, setUserIndex } from "../websocket";
+import { websocket, messages, userIndex } from "../app";
+import { message, sendEvent, setUserIndex, ChatEvent } from "../websocket";
+
+const USER_COLORS = [
+	"blue",
+	"red",
+	"green",
+	"orange",
+] as const;
 
 export default function Chat() {
     
@@ -40,10 +47,49 @@ export default function Chat() {
             </div>
 	
 				<ul id="display"> 
-                    {messages.value}
+                    {messages.value.map(toChatComponent)}
                 </ul>
 	
 		</div>
     );
+
+}
+
+function toChatComponent(event: ChatEvent): preact.JSX.Element {
+
+    if(event.type === "Message") {
+        return (
+            <li 
+                class={userIndex.value === event.data.user_idx ? "message right" : "message left"}
+                style={`--user-color: ${USER_COLORS[event.data.user_idx]}`}
+            > 
+                {event.data.content} 
+            </li>
+        );
+    }
+    
+    if(event.type === "Join") {
+        return (
+            <li 
+                class={userIndex.value === event.data ? "join right" : "join left"}
+                style={`--user-color: ${USER_COLORS[event.data]}`}
+            > 
+                {userIndex.value === event.data ? "You" : "They"} Joined
+            </li>
+        );
+    }
+
+    if(event.type === "Leave") {
+        return (
+            <li 
+                class={userIndex.value === event.data ? "leave right" : "leave left"}
+                style={`--user-color: ${USER_COLORS[event.data]}`}
+            > 
+                {userIndex.value === event.data ? "You" : "They"} Left
+            </li>
+        )
+    }
+
+    return <></>
 
 }

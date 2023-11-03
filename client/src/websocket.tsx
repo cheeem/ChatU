@@ -1,8 +1,9 @@
-import { x500, contacts, websocket, messages, userIndex, mainState, } from "./app";
+import { x500, contacts, websocket, messages, userIndex, mainState, connectState, connectContacts, } from "./app";
 import { Contacts, UserContacts } from "./contacts";
 
 type ClientEvent = keyof typeof CLIENT_EVENT_MAP;
 type ServerEvent = ServerMessage | ServerJoin | ServerLeave | ServerConnectRequest | ServerConnectSuccess | ServerConnectFailure;
+export type ChatEvent = ServerMessage | ServerJoin | ServerLeave;
 
 type ServerMessage = { readonly type: "Message", readonly data: Message, };
 type ServerJoin = { readonly type: "Join", readonly data: number, };
@@ -17,14 +18,8 @@ const CLIENT_EVENT_MAP = {
 	"Skip": 0,
 	"Leave": 1,
 	"Connect": 2,
+	"ConnectCancel": 3,
 } as const;
-
-const USER_COLORS = [
-	"blue",
-	"red",
-	"green",
-	"orange",
-] as const;
 
 export function join() {
 
@@ -41,8 +36,6 @@ export function join() {
 		}
 
 	}
-
-	console.log(url)
 
 	try {
 		websocket.value = new WebSocket(url);
@@ -68,14 +61,27 @@ export function setUserIndex(receivedEvent: MessageEvent) {
 
 }
 
-export function sendEvent(event: ClientEvent) {
+export function sendEvent(event: ClientEvent, payload?: Uint8Array) {
 	
 	if(!websocket.value) {
 		return;
 	}
 
-	const uint8: Uint8Array = new Uint8Array(1);
+	let len: number = payload ? payload.length : 0;
+
+	//console.log(payload?.length, len);
+
+	const uint8: Uint8Array = new Uint8Array(1 + len);
+
 	uint8[0] = CLIENT_EVENT_MAP[event];
+
+	for(let i = 0; i < len; i++) {
+		//console.log(payload![i])
+		uint8[i+1] = payload![i];
+	}
+
+	//console.log(uint8);
+
 	websocket.value.send(uint8.buffer);
 
 }
@@ -100,40 +106,39 @@ function messageReceived(receivedEvent: MessageEvent) {
 
     const serverEvent: ServerEvent = JSON.parse(receivedEvent.data) as ServerEvent;
 
-    console.log(serverEvent);
+    //console.log(serverEvent);
 
-    if(serverEvent.type === "Message"){
-        messages.value = [...messages.value, (
-			<li 
-				class={userIndex.value === serverEvent.data.user_idx ? "message right" : "message left"}
-				style={`--user-color: ${USER_COLORS[serverEvent.data.user_idx]}`}
-			> 
-				{serverEvent.data.content} 
-			</li>
-		)];
+    if(serverEvent.type === "Message") {
+        return messages.value = [...messages.value, serverEvent];
     }
 
-	if(serverEvent.type === "Join"){
-        messages.value = [...messages.value, (
-			<li 
-				class={userIndex.value === serverEvent.data ? "join right" : "join left"}
-				style={`--user-color: ${USER_COLORS[serverEvent.data]}`}
-			> 
-				{userIndex.value === serverEvent.data ? "You" : "They"} Joined
-			</li>
-		)];
+	if(serverEvent.type === "Join") {
+        return messages.value = [...messages.value, serverEvent];
     }
 
-	if(serverEvent.type === "Leave"){
-        messages.value = [...messages.value, (
-			<li 
-				class={userIndex.value === serverEvent.data ? "leave right" : "leave left"}
-				style={`--user-color: ${USER_COLORS[serverEvent.data]}`}
-			> 
-				{userIndex.value === serverEvent.data ? "You" : "They"} Left
-			</li>
-		)];
+	if(serverEvent.type === "Leave") {
+        return messages.value = [...messages.value, serverEvent];
     }
+
+	if(serverEvent.type === "ConnectRequest") {
+		
+		if(connectState.value !== "sent") {
+			connectState.value = "request"
+		}
+
+		return;
+
+	}
+
+	if(serverEvent.type === "ConnectFailure") {
+		return connectState.value = "failure";
+	}
+
+	if(serverEvent.type === "ConnectSuccess") {
+		//connectContacts.value = null;
+		connectContacts.value = serverEvent.data;
+		return connectState.value = "success";
+	}
 
 }
 

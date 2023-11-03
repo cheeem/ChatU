@@ -5,6 +5,7 @@ import { MutableRef, useRef } from "preact/hooks";
 import { contacts } from "../app";
 import { join } from "../websocket";
 
+//change to an array
 type ContactsRef = {
 	first_name: MutableRef<null | HTMLInputElement>,
 	last_name: MutableRef<null | HTMLInputElement>,
@@ -16,12 +17,12 @@ type ContactsRef = {
 
 export default function Join() {
 
-	const first_name = useRef(null);
-	const last_name = useRef(null);
-	const phone_number = useRef(null);
-	const instagram = useRef(null);
-	const snapchat = useRef(null);
-	const discord = useRef(null);
+	const first_name = useRef<null | HTMLInputElement>(null);
+	const last_name = useRef<null | HTMLInputElement>(null);
+	const phone_number = useRef<null | HTMLInputElement>(null);
+	const instagram = useRef<null | HTMLInputElement>(null);
+	const snapchat = useRef<null | HTMLInputElement>(null);
+	const discord = useRef<null | HTMLInputElement>(null);
 
     return (
         <div id="join">
