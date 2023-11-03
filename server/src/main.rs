@@ -9,7 +9,6 @@ use futures::sink::SinkExt;
 use futures::stream::{ SplitSink, SplitStream, StreamExt };
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt };
 use serde::{ Deserialize, Serialize };
 use serde_json;
 use std::sync::{ Arc, Mutex, MutexGuard };
@@ -32,12 +31,12 @@ enum SendEvent {
 
 #[derive(Serialize, Clone)]
 #[serde(tag = "type", content = "data")]
+//#[serde(rename_all = "camelCase")]
 enum ServerEvent { // maybe these should be serialized before sending to all users so we're just sending a string?
     Message { user_idx: usize, content: String, },
     Join(usize),
-    Skip(usize),
     Leave(usize),
-    ConnectRequest /*{ contact_fields: Arc<[ContactField]> }*/,
+    ConnectRequest/*(Arc<[usize]>)*/,
     ConnectSuccess(Arc<[UserContacts]>),
     ConnectFailure,
 }
@@ -139,7 +138,7 @@ impl ServerEvent {
     fn send(&self, tx: &broadcast::Sender<SendEvent>) {
         match serde_json::to_string(self) {
             Ok(json) => { let _ = tx.send(SendEvent::ServerEvent(json)); },
-            Err(error) => (),
+            Err(_) => (),
         }
     }
 
@@ -238,11 +237,6 @@ const MAX_ROOM_SIZE: usize = 2;
 
 #[tokio::main]
 async fn main() {
-    
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "chatu=trace".into()))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
 
     let pool: Pool<MySql> = MySqlPoolOptions::new()
         .connect("mysql://cheemie:ex_pw@localhost:3306/chatu")
@@ -267,9 +261,9 @@ async fn main() {
         .layer(cors)
         .layer(Extension(pool));
 
-    let listener: TcpListener = TcpListener::bind("127.0.0.1:3000").unwrap();
+    let listener: TcpListener = TcpListener::bind("localhost:8080").unwrap();
 
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    println!("listening on {}", listener.local_addr().unwrap());
 
     axum::Server::from_tcp(listener)
         .unwrap()
@@ -281,7 +275,17 @@ async fn main() {
 
 async fn get_connections(Query(User { x500, }): Query<User>, Extension(pool): Extension<Pool<MySql>>) -> Result<response::Json<Vec<Contacts>>, StatusCode> {
 
-    let sql: &str = &format!("SELECT * FROM connections WHERE x500 = \"{x500}\"");
+    let sql: &str = &format!("
+        SELECT 
+            partner_x500 AS x500, 
+            first_name, 
+            last_name, 
+            phone_number,  
+            instagram,
+            snapchat,
+            discord 
+        FROM connections WHERE x500 = \"{x500}\"
+    ");
     
     let connections: Vec<Contacts> = sqlx::query_as(sql)
         .fetch_all(&pool)
@@ -409,7 +413,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
 
         let (tx, mut rx, room_idx, user_idx) = find_room(&app.rooms, &skipped_users, &x500);
 
-        if sender.send(Message::Text(room_idx.to_string())).await.is_err() {
+        if sender.send(Message::Text(user_idx.to_string())).await.is_err() {
             return;
         }
     
@@ -423,6 +427,7 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
 
                 match event {
                     SendEvent::SkipEvent(idx) => {
+                        
                         if user_idx == idx {
                             break;
                         }
@@ -430,9 +435,11 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                         continue;
                     }
                     SendEvent::ServerEvent(json) => {
+                        
                         if sender.send(Message::Text(json)).await.is_err() {
                             break;
                         }
+
                     }
                 }
 
@@ -454,9 +461,11 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                     }
                     Message::Binary(bytes) => {
 
-                        let mut bytes = bytes.iter();
+                        println!("{:#?}", bytes);
 
-                        if let Some(event) = bytes.next().and_then(|u8| ClientEvent::from_u8(*u8)) {
+                        let mut bytes = bytes.into_iter();
+
+                        if let Some(event) = bytes.next().and_then(|u8| ClientEvent::from_u8(u8)) {
 
                             match event {
                                 ClientEvent::Skip => {
@@ -492,19 +501,25 @@ async fn websocket(stream: WebSocket, mut app: Arc<ChatApp>, mut x500: String, m
                                         // maybe move this into a UserContacts impl function
                                         //try and see if there's a way to avoid copying data until a connection is made
 
-                                        room.connection.as_mut().unwrap().push(UserContacts { 
+                                        println!("{:#?}", contacts);
+
+                                        let new_con = UserContacts { 
                                             x500: x500.to_owned(),
-                                            first_name: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.first_name.to_owned()),
-                                            last_name: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.last_name.to_owned()),
-                                            phone_number: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.phone_number.to_owned()),
-                                            instagram: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.instagram.to_owned()), 
-                                            snapchat: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.snapchat.to_owned()),
-                                            discord: bytes.next().filter(|byte| **byte == 1).and_then(|_| contacts.discord.to_owned()),
-                                        });
+                                            first_name: bytes.next().filter(|byte| *byte == 1).and_then(|_| contacts.first_name.to_owned()),
+                                            last_name: bytes.next().filter(|byte| *byte == 1).and_then(|_| contacts.last_name.to_owned()),
+                                            phone_number: bytes.next().filter(|byte| *byte == 1).and_then(|_| contacts.phone_number.to_owned()),
+                                            instagram: bytes.next().filter(|byte| *byte == 1).and_then(|_| contacts.instagram.to_owned()), 
+                                            snapchat: bytes.next().filter(|byte| *byte == 1).and_then(|_| contacts.snapchat.to_owned()),
+                                            discord: bytes.next().filter(|byte| *byte == 1).and_then(|_| contacts.discord.to_owned()),
+                                        };
+
+                                        println!("{:#?}", new_con);
+
+                                        room.connection.as_mut().unwrap().push(new_con);
 
                                     }
 
-                                    let all_users_connected: bool = !first_connection || room.connection.as_mut().unwrap().len() == room.users.len();
+                                    let all_users_connected: bool = !first_connection && room.connection.as_mut().unwrap().len() == room.users.len();
 
                                     if all_users_connected {
 
