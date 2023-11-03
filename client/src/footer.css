@@ -1,0 +1,37 @@
+footer {
+    padding: var(--side-padding);
+
+    background-color: var(--neutral3);
+}
+
+footer .footer-wrapper {
+    display: grid;
+    gap: 1em;
+
+    width: fit-content;
+}
+
+footer * {
+    color: var(--neutral1);
+}
+
+footer .divider {
+    height: 0.3em;
+    width: 100%;
+
+    background-color: var(--neutral4);
+}
+
+footer .links {
+    display: flex;
+}
+
+footer .links ul {
+    display: flex; 
+    flex-direction: column;
+    gap: 1em;
+}
+
+footer .links a:hover {
+    text-decoration: underline;
+}
