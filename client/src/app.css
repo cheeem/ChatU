@@ -1,0 +1,10 @@
+#app {
+    display: flex;
+}
+
+#loading {
+    height: 100%;
+
+    display: grid;
+    place-items: center;
+}
